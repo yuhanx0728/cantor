@@ -2,7 +2,8 @@ package com.salesforce.cantor.phoenix;
 
 import com.salesforce.cantor.Events;
 import com.salesforce.cantor.jdbc.AbstractBaseEventsOnJdbc;
-
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.sql.*;
@@ -38,29 +39,11 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
     }
 
     private String serializeDimensions(Map<String, Double> dimensions) {
-        if (dimensions.isEmpty()) {
-            return "";
-        }
-        StringBuilder header = new StringBuilder();
-        StringBuilder value = new StringBuilder();
-        for (Map.Entry<String, Double> e: dimensions.entrySet()) {
-            header.append(e.getKey()).append(";;");
-            value.append(e.getValue()).append(";;");
-        }
-        return header.append("\n").append(value.toString()).toString();
+        return new Gson().toJson(dimensions, new TypeToken<Map<String, Double>>(){}.getType());
     }
 
     private String serializeMetadata(Map<String, String> metadata) {
-        if (metadata.isEmpty()) {
-            return "";
-        }
-        StringBuilder header = new StringBuilder();
-        StringBuilder value = new StringBuilder();
-        for (Map.Entry<String, String> e: metadata.entrySet()) {
-            header.append(e.getKey()).append(";;");
-            value.append("\"").append(e.getValue()).append("\"").append(";;");
-        }
-        return header.append("\n").append(value.toString()).toString();
+        return new Gson().toJson(metadata, new TypeToken<Map<String, String>>(){}.getType());
     }
 
     @Override
@@ -163,29 +146,11 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
     }
 
     private Map<String, String> deserializeMetadata(String metadataString) {
-        Map<String, String> metadata = new HashMap<>();
-        String[] lines = metadataString.split("\n");
-        if (lines.length == 2) {
-            String[] header = lines[0].split(";;");
-            String[] values = lines[1].split(";;");
-            for (int i = 0; i < header.length; i ++) {
-                metadata.put(header[i], values[i].substring(1, values[i].length() - 1));
-            }
-        }
-        return metadata;
+        return new Gson().fromJson(metadataString, new TypeToken<Map<String, String>>(){}.getType());
     }
 
     private Map<String, Double> deserializeDimensions(String dimensionsString) {
-        Map<String, Double> dimensions = new HashMap<>();
-        String[] lines = dimensionsString.split("\n");
-        if (lines.length == 2) {
-            String[] header = lines[0].split(";;");
-            String[] values = lines[1].split(";;");
-            for (int i = 0; i < header.length; i ++) {
-                dimensions.put(header[i], Double.parseDouble(values[i]));
-            }
-        }
-        return dimensions;
+        return new Gson().fromJson(dimensionsString, new TypeToken<Map<String, Double>>(){}.getType());
     }
 
     @Override
