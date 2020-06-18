@@ -2,6 +2,7 @@ package com.salesforce.cantor.phoenix;
 
 import com.salesforce.cantor.Events;
 import com.salesforce.cantor.jdbc.AbstractBaseEventsOnJdbc;
+import org.apache.commons.lang3.StringUtils;
 
 import javax.sql.DataSource;
 import java.io.IOException;
@@ -12,55 +13,83 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
 
     public EventsOnPhoenix(final DataSource dataSource) throws IOException {
         super(dataSource);
-        String createTableSql = "CREATE TABLE IF NOT EXISTS CANTOR_EVENTS (timestampMillis BIGINT NOT NULL, " +
-                "namespace VARCHAR, dimensions VARCHAR, metadata VARCHAR, payload VARBINARY, id BIGINT NOT NULL " +
-                "CONSTRAINT pk PRIMARY KEY (timestampMillis, id))";
-        String createSequenceSql = "CREATE SEQUENCE IF NOT EXISTS CANTOR_EVENTS_ID";
+        String createTableSql = "create table if not exists cantor_events (" +
+                                    "id BIGINT not null, " +
+                                    "timestampMillis BIGINT not null, " +
+                                    "namespace VARCHAR, " +
+                                    "dimensions.iid INTEGER, " +
+                                    "metadata.iid INTEGER, " +
+                                    "payload VARBINARY " +
+                                    "CONSTRAINT pk PRIMARY KEY (id, timestampMillis))";
+        String createSequenceSql = "create sequence if not exists cantor_events_id";
         executeUpdate(createTableSql);
         executeUpdate(createSequenceSql);
     }
 
+    /**
+     * column names under metadata and dimensions column families are case sensitive and thus need to have quotes around
+     * them in sql queries, e.g. select metadata."host" from cantor_events. It is because said names can contain special
+     * characters like "-" that would not be parsed as names without the quotes.
+     * @param namespace the namespace identifier
+     * @param batch batch of events
+     * @throws IOException
+     */
     @Override
     public void store(String namespace, Collection<Event> batch) throws IOException {
-        String upsertSql = "UPSERT INTO CANTOR_EVENTS VALUES (?, ?, ?, ?, ?, NEXT VALUE FOR CANTOR_EVENTS_ID)";
+        StringBuilder alterTableMetadataBuilder = new StringBuilder("alter table cantor_events add if not exists ");
+        StringBuilder alterTableDimensionsBuilder = new StringBuilder("alter table cantor_events add if not exists ");
+        StringJoiner metadataColNameJoiner = new StringJoiner(", ");
+        StringJoiner dimensionsColNameJoiner = new StringJoiner(", ");
+        StringBuilder upsertSqlPrefix = new StringBuilder("upsert into cantor_events (id, ");
+        StringBuilder upsertSqlInfix = new StringBuilder(") values (next value for cantor_events_id, ");
+        StringJoiner colNameJoiner = new StringJoiner(", ");
+        StringJoiner paramJoiner = new StringJoiner(", ");
         Connection connection = null;
         try {
             connection = openTransaction(getConnection());
-            final List<Object[]> parameters = new ArrayList<>();
+            final List<Object> upsertParameters = new ArrayList<>();
+            final Set<String> mKeys = new HashSet<>();
+            final Set<String> dKeys = new HashSet<>();
             for (Event e : batch) {
-                parameters.add(new Object[]{e.getTimestampMillis(), namespace, serializeDimensions(e.getDimensions()),
-                        serializeMetadata(e.getMetadata()), e.getPayload()});
+                mKeys.addAll(e.getMetadata().keySet());
+                dKeys.addAll(e.getDimensions().keySet());
             }
-            executeBatchUpdate(connection, upsertSql, parameters);
+            for (String key : mKeys) {
+                metadataColNameJoiner.add("metadata.\"" + key + "\"" + " VARCHAR");
+            }
+            alterTableMetadataBuilder.append(metadataColNameJoiner.toString());
+            executeUpdate(connection, alterTableMetadataBuilder.toString());
+
+            for (String key : dKeys) {
+                dimensionsColNameJoiner.add("dimensions.\"" + key + "\"" + " DOUBLE");
+            }
+            alterTableDimensionsBuilder.append(dimensionsColNameJoiner.toString());
+            executeUpdate(connection, alterTableDimensionsBuilder.toString());
+
+            for (Event e : batch) {
+                colNameJoiner.add("timestampMillis").add("namespace").add("payload");
+                upsertParameters.add(e.getTimestampMillis());
+                upsertParameters.add(namespace);
+                upsertParameters.add(e.getPayload());
+                Map<String, Double> dimensions = e.getDimensions();
+                paramJoiner.add("?").add("?").add("?");
+                for (String key : dimensions.keySet()) {
+                    colNameJoiner.add("dimensions.\"" + key + "\"");
+                    upsertParameters.add(dimensions.get(key));
+                    paramJoiner.add("?");
+                }
+                Map<String, String> metadata = e.getMetadata();
+                for (String key: metadata.keySet()) {
+                    colNameJoiner.add("metadata.\"" + key + "\"");
+                    upsertParameters.add(metadata.get(key));
+                    paramJoiner.add("?");
+                }
+                executeUpdate(connection, upsertSqlPrefix.append(colNameJoiner.toString()).append(upsertSqlInfix)
+                                .append(paramJoiner.toString()).append(")").toString(), upsertParameters.toArray());
+            }
         } finally {
             closeConnection(connection);
         }
-    }
-
-    private String serializeDimensions(Map<String, Double> dimensions) {
-        if (dimensions.isEmpty()) {
-            return "";
-        }
-        StringBuilder header = new StringBuilder();
-        StringBuilder value = new StringBuilder();
-        for (Map.Entry<String, Double> e: dimensions.entrySet()) {
-            header.append(e.getKey()).append(";;");
-            value.append(e.getValue()).append(";;");
-        }
-        return header.append("\n").append(value.toString()).toString();
-    }
-
-    private String serializeMetadata(Map<String, String> metadata) {
-        if (metadata.isEmpty()) {
-            return "";
-        }
-        StringBuilder header = new StringBuilder();
-        StringBuilder value = new StringBuilder();
-        for (Map.Entry<String, String> e: metadata.entrySet()) {
-            header.append(e.getKey()).append(";;");
-            value.append("\"").append(e.getValue()).append("\"").append(";;");
-        }
-        return header.append("\n").append(value.toString()).toString();
     }
 
     @Override
