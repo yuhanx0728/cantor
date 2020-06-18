@@ -17,8 +17,6 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
                                     "id BIGINT not null, " +
                                     "timestampMillis BIGINT not null, " +
                                     "namespace VARCHAR, " +
-                                    "dimensions.iid INTEGER, " +
-                                    "metadata.iid INTEGER, " +
                                     "payload VARBINARY " +
                                     "CONSTRAINT pk PRIMARY KEY (id, timestampMillis))";
         String createSequenceSql = "create sequence if not exists cantor_events_id";
@@ -30,6 +28,10 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
      * column names under metadata and dimensions column families are case sensitive and thus need to have quotes around
      * them in sql queries, e.g. select metadata."host" from cantor_events. It is because said names can contain special
      * characters like "-" that would not be parsed as names without the quotes.
+     *
+     * If alter table query contains both metadata."a" and dimensions."a", it will throw an exception for illegal
+     * concurrent operations. That is why alter table queries for metadata and dimensions are separated.
+     *
      * @param namespace the namespace identifier
      * @param batch batch of events
      * @throws IOException
@@ -54,17 +56,16 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
                 mKeys.addAll(e.getMetadata().keySet());
                 dKeys.addAll(e.getDimensions().keySet());
             }
-            for (String key : mKeys) {
-                metadataColNameJoiner.add("metadata.\"" + key + "\"" + " VARCHAR");
-            }
-            alterTableMetadataBuilder.append(metadataColNameJoiner.toString());
-            executeUpdate(connection, alterTableMetadataBuilder.toString());
-
             for (String key : dKeys) {
-                dimensionsColNameJoiner.add("dimensions.\"" + key + "\"" + " DOUBLE");
+                dimensionsColNameJoiner.add("\"d_" + key + "\"" + " DOUBLE");
+            }
+            for (String key : mKeys) {
+                metadataColNameJoiner.add("\"m_" + key + "\"" + " VARCHAR");
             }
             alterTableDimensionsBuilder.append(dimensionsColNameJoiner.toString());
+            alterTableMetadataBuilder.append(metadataColNameJoiner.toString());
             executeUpdate(connection, alterTableDimensionsBuilder.toString());
+            executeUpdate(connection, alterTableMetadataBuilder.toString());
 
             for (Event e : batch) {
                 colNameJoiner.add("timestampMillis").add("namespace").add("payload");
@@ -74,13 +75,13 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
                 Map<String, Double> dimensions = e.getDimensions();
                 paramJoiner.add("?").add("?").add("?");
                 for (String key : dimensions.keySet()) {
-                    colNameJoiner.add("dimensions.\"" + key + "\"");
+                    colNameJoiner.add("\"d_" + key + "\"");
                     upsertParameters.add(dimensions.get(key));
                     paramJoiner.add("?");
                 }
                 Map<String, String> metadata = e.getMetadata();
                 for (String key: metadata.keySet()) {
-                    colNameJoiner.add("metadata.\"" + key + "\"");
+                    colNameJoiner.add("\"m_" + key + "\"");
                     upsertParameters.add(metadata.get(key));
                     paramJoiner.add("?");
                 }
@@ -98,40 +99,40 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
                            boolean includePayloads, boolean ascending, int limit) throws IOException {
         List<Event> events = new ArrayList<>();
         ResultSet rset;
-        StringBuilder query = new StringBuilder();
-        query.append("SELECT * FROM CANTOR_EVENTS WHERE timestampMillis >= ").append(startTimestampMillis)
-             .append(" AND timestampMillis < ").append(endTimestampMillis)
-             .append(" AND namespace = '").append(namespace).append("'");
-        if (dimensionsQuery != null) {
-            for (String key : dimensionsQuery.keySet()) {
-                query.append(" AND INSTR(dimensions, '").append(key).append("') > 0");
-            }
-        }
-        if (metadataQuery != null) {
-            for (String key : metadataQuery.keySet()) {
-                query.append(" AND INSTR(metadata, '").append(key).append("') > 0");
-            }
-        }
+        StringBuilder query = new StringBuilder("select * from cantor_events where ");
+        StringJoiner queryJoiner = new StringJoiner(" and ");
+        queryJoiner.add("timestampMillis between " + startTimestampMillis + " and " + endTimestampMillis);
+        queryJoiner.add("namespace = \'" + namespace + "\'");
+        getDimensionQueries(dimensionsQuery, queryJoiner); // update queryJoiner with dimensions queries
+        getMetadataQueries(metadataQuery, queryJoiner); // update queryJoiner with metadata queries
+        query.append(queryJoiner.toString());
         if (ascending) {
-            query.append(" ORDER BY timestampMillis ASC");
+            query.append(" order by timestampMillis asc");
         } else {
-            query.append(" ORDER BY timestampMillis DESC");
+            query.append(" order by timestampMillis desc");
         }
         if (limit > 0) {
-            query.append(" LIMIT ").append(limit);
+            query.append(" limit ").append(limit);
         }
+        System.out.println(query.toString());
         try {
             Connection con = getConnection();
             PreparedStatement statement = con.prepareStatement(query.toString());
             rset = statement.executeQuery();
             while (rset.next()) {
-                Map<String, String> metadata = deserializeMetadata(rset.getString("metadata"));
-                Map<String, Double> dimensions = deserializeDimensions(rset.getString("dimensions"));
-                if (dimensionsMatches(dimensionsQuery, dimensions) && metadataMatches(metadataQuery, metadata)) {
-                    Event e = new Event(rset.getLong("timestampMillis"), metadata, dimensions,
-                            (includePayloads) ? rset.getBytes("payload") : null);
-                    events.add(e);
+                Map<String, String> metadata = new HashMap<>();
+                Map<String, Double> dimensions = new HashMap<>();
+                for (int i = 1; i <= rset.getMetaData().getColumnCount(); i ++) {
+                    final String columnName = rset.getMetaData().getColumnName(i);
+                    if (columnName.startsWith("m_")) { //TODO: what if empty metadata?
+                        metadata.put(columnName.substring(2), rset.getString(i));
+                    } else if (columnName.startsWith("d_")) { //TODO: what if empty dimensions?
+                        dimensions.put(columnName.substring(2), rset.getDouble(i));
+                    }
                 }
+                Event e = new Event(rset.getLong("timestampMillis"), metadata, dimensions,
+                            (includePayloads) ? rset.getBytes("payload") : null);
+                events.add(e);
             }
             statement.close();
             con.close();
@@ -141,80 +142,30 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
         return events;
     }
 
-    private boolean metadataMatches(Map<String, String> query, Map<String, String> metadata) {
-        if (query == null) {
-            return true;
+    private void getDimensionQueries(Map<String, String> dimensionsQuery, StringJoiner queryJoiner) {
+        if (dimensionsQuery == null) {
+            return;
         }
-        for (Map.Entry<String, String> entry : query.entrySet()) {
-            String md = entry.getKey();
-            String exp = entry.getValue();
-            if (exp.startsWith("~")) {
-                String newExp = exp.substring(1).replace("*", ".*");
-                if (!metadata.get(md).matches(newExp)) {
-                    return false;
-                }
-            } else {
-                String newExp = (exp.startsWith("=")) ? exp.substring(1) : exp;
-                if (metadata.get(md) != newExp) {
-                    return false;
-                }
-            }
+        for (Map.Entry<String, String> query : dimensionsQuery.entrySet()) {
+            String column = query.getKey();
+            String condition = query.getValue();
+            queryJoiner.add("\"d_" + column + "\"" + condition);
         }
-        return true;
     }
 
-    private boolean dimensionsMatches(Map<String, String> query, Map<String, Double> dimensions) {
-        if (query == null) {
-            return true;
+    private void getMetadataQueries(Map<String, String> metadataQuery, StringJoiner queryJoiner) {
+        if (metadataQuery == null) {
+            return;
         }
-        for (Map.Entry<String, String> entry : query.entrySet()) {
-            String dim = entry.getKey();
-            String exp = entry.getValue();
-            if (exp.startsWith(">=") && !(dimensions.get(dim) >= Double.parseDouble(exp.substring(2)))) {
-                return false;
-            } else if (exp.startsWith("<=") && !(dimensions.get(dim) <= Double.parseDouble(exp.substring(2)))) {
-                return false;
-            } else if (exp.startsWith(">") && !(dimensions.get(dim) > Double.parseDouble(exp.substring(1)))) {
-                return false;
-            } else if (exp.startsWith("<") && !(dimensions.get(dim) < Double.parseDouble(exp.substring(1)))) {
-                return false;
-            } else if (exp.startsWith("=") && dimensions.get(dim) != Double.parseDouble(exp.substring(1))) {
-                return false;
-            } else if (exp.contains("..")) {
-                double start = Double.parseDouble(exp.substring(0, exp.indexOf("..")));
-                double end = Double.parseDouble(exp.substring(exp.indexOf("..")+2));
-                if (dimensions.get(dim) <= start || dimensions.get(dim) >= end) {
-                    return false;
-                }
+        for (Map.Entry<String, String> query : metadataQuery.entrySet()) {
+            String column = query.getKey();
+            String condition = query.getValue();
+            if (condition.startsWith("~")) {
+                queryJoiner.add("\"m_" + column + "\" like \'" + condition.substring(1).replaceAll("\\.\\*", "%") + "\'");
+            } else { // exact match
+                queryJoiner.add("\"m_" + column + "\" = \'" + ((condition.startsWith("=")) ? condition.substring(1): condition) + "\'");
             }
         }
-        return true;
-    }
-
-    private Map<String, String> deserializeMetadata(String metadataString) {
-        Map<String, String> metadata = new HashMap<>();
-        String[] lines = metadataString.split("\n");
-        if (lines.length == 2) {
-            String[] header = lines[0].split(";;");
-            String[] values = lines[1].split(";;");
-            for (int i = 0; i < header.length; i ++) {
-                metadata.put(header[i], values[i].substring(1, values[i].length() - 1));
-            }
-        }
-        return metadata;
-    }
-
-    private Map<String, Double> deserializeDimensions(String dimensionsString) {
-        Map<String, Double> dimensions = new HashMap<>();
-        String[] lines = dimensionsString.split("\n");
-        if (lines.length == 2) {
-            String[] header = lines[0].split(";;");
-            String[] values = lines[1].split(";;");
-            for (int i = 0; i < header.length; i ++) {
-                dimensions.put(header[i], Double.parseDouble(values[i]));
-            }
-        }
-        return dimensions;
     }
 
     @Override
