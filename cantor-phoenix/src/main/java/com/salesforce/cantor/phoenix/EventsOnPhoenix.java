@@ -38,17 +38,18 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
      */
     @Override
     public void store(String namespace, Collection<Event> batch) throws IOException {
+        StringBuilder sqlQuery = new StringBuilder();
         StringBuilder alterTableMetadataBuilder = new StringBuilder("alter table cantor_events add if not exists ");
         StringBuilder alterTableDimensionsBuilder = new StringBuilder("alter table cantor_events add if not exists ");
         StringJoiner metadataColNameJoiner = new StringJoiner(", ");
         StringJoiner dimensionsColNameJoiner = new StringJoiner(", ");
-        StringBuilder upsertSqlPrefix = new StringBuilder("upsert into cantor_events (id, ");
-        StringBuilder upsertSqlInfix = new StringBuilder(") values (next value for cantor_events_id, ");
+        String upsertSqlPrefix = "upsert into cantor_events (id, ";
+        String upsertSqlInfix = ") values (next value for cantor_events_id, ";
         StringJoiner colNameJoiner = new StringJoiner(", ");
         StringJoiner paramJoiner = new StringJoiner(", ");
-        Connection connection = null;
+//        Connection connection = null;
         try {
-            connection = openTransaction(getConnection());
+//            connection = openTransaction(getConnection());
             final List<Object> upsertParameters = new ArrayList<>();
             final Set<String> mKeys = new HashSet<>();
             final Set<String> dKeys = new HashSet<>();
@@ -64,10 +65,11 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
             }
             alterTableDimensionsBuilder.append(dimensionsColNameJoiner.toString());
             alterTableMetadataBuilder.append(metadataColNameJoiner.toString());
-            executeUpdate(connection, alterTableDimensionsBuilder.toString());
-            executeUpdate(connection, alterTableMetadataBuilder.toString());
+            executeUpdate(alterTableDimensionsBuilder.toString());
+            executeUpdate(alterTableMetadataBuilder.toString());
 
             for (Event e : batch) {
+                sqlQuery = new StringBuilder();
                 colNameJoiner.add("timestampMillis").add("namespace").add("payload");
                 upsertParameters.add(e.getTimestampMillis());
                 upsertParameters.add(namespace);
@@ -85,11 +87,13 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
                     upsertParameters.add(metadata.get(key));
                     paramJoiner.add("?");
                 }
-                executeUpdate(connection, upsertSqlPrefix.append(colNameJoiner.toString()).append(upsertSqlInfix)
-                                .append(paramJoiner.toString()).append(")").toString(), upsertParameters.toArray());
+                String finalSql = sqlQuery.append(upsertSqlPrefix).append(colNameJoiner.toString())
+                                          .append(upsertSqlInfix).append(paramJoiner.toString()).append(")").toString();
+//                System.out.println(finalSql);
+                executeUpdate(finalSql, upsertParameters.toArray());
             }
         } finally {
-            closeConnection(connection);
+//            closeConnection(connection);
         }
     }
 
@@ -114,7 +118,6 @@ public class EventsOnPhoenix extends AbstractBaseEventsOnJdbc implements Events 
         if (limit > 0) {
             query.append(" limit ").append(limit);
         }
-        System.out.println(query.toString());
         try {
             Connection con = getConnection();
             PreparedStatement statement = con.prepareStatement(query.toString());
